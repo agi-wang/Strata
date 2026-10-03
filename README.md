@@ -58,7 +58,8 @@ other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size), [commu
 Everything else is installed for you. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
 The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
 
-Cross-machine KV transfer in this fork: [setup and measured validation](docs/CROSS_HOST_KV.md).
+Three independent workers with one entry point: [sticky forwarding](docs/STICKY_GATEWAY.md).
+Explicit cross-machine KV diagnostics: [endpoints and measured validation](docs/CROSS_HOST_KV.md).
 
 ## Install
 

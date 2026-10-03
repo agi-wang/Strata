@@ -1,108 +1,43 @@
-"""OpenAI gateway: round-robin workers with real, bounded cross-host snapshots.
+"""OpenAI gateway: stable conversation routing to independent Strata workers.
 
 Run: python -m serve.kv_gateway --config kv-pool.json
 Authentication uses STRATA_API_KEY. X-Strata-Session identifies a conversation;
-otherwise its initial messages identify the cache branch. Snapshots are ephemeral
-private files and are removed on eviction or shutdown.
+otherwise its initial messages identify the cache branch. KV stays on its worker.
 """
 import argparse
-import collections
 import hashlib
 import hmac
 import json
 import os
-import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import requests
 
-MAX_SNAPSHOT = 1024 * 1024 * 1024
-
 class Pool:
-    def __init__(self, workers, key, budget=4096 * 1024 * 1024, slots=16):
+    def __init__(self, workers, key):
         if not workers or not key:
             raise ValueError("workers and STRATA_API_KEY are required")
         self.workers = [w.rstrip("/") for w in workers]
-        self.key, self.budget, self.slots = key, budget, slots
+        self.key = key
         self.locks = [threading.Lock() for _ in workers]
         self.mutex = threading.Lock()
         self.next = 0
-        self.cache = collections.OrderedDict()
-        self.directory = tempfile.TemporaryDirectory(prefix="strata-kv-pool-")
-        self.stats = {"imports": 0, "exports": 0, "import_bytes": 0, "export_bytes": 0, "cache_errors": 0}
+        self.stats = {"requests": 0, "errors": 0}
+        self.requests_by_worker = [0 for _ in workers]
         self.admission = threading.BoundedSemaphore(64)
     def headers(self):
         return {"Authorization": "Bearer " + self.key}
-    def choose(self):
+    def choose(self, session=None):
         with self.mutex:
-            index = self.next % len(self.workers)
-            self.next += 1
+            if session:
+                index = int(session[:16], 16) % len(self.workers)
+            else:
+                index = self.next % len(self.workers)
+                self.next += 1
+            self.stats["requests"] += 1
+            self.requests_by_worker[index] += 1
             return index
-    def import_session(self, session, worker):
-        if not session:
-            return False
-        with self.mutex:
-            item = self.cache.get(session)
-            if not item or item["worker"] == worker:
-                return False
-            self.cache.move_to_end(session)
-            f = open(item["path"], "rb")  # Open under lock; eviction cannot invalidate this fd.
-        try:
-            with f, requests.post(self.workers[worker] + "/v1/cache/import", data=f,
-                headers={**self.headers(), "Content-Type": "application/octet-stream",
-                         "X-Strata-KV-SHA256": item["sha"], "X-Strata-KV-Model": item["identity"]},
-                timeout=(10, 120)) as r:
-                r.raise_for_status()
-            with self.mutex:
-                self.stats["imports"] += 1
-                self.stats["import_bytes"] += item["size"]
-            return True
-        except (OSError, requests.RequestException):
-            with self.mutex:
-                self.stats["cache_errors"] += 1
-            return False  # Cache misses safely compute the full prompt.
-    def export_session(self, session, worker):
-        if not session:
-            return
-        path = None
-        try:
-            with requests.post(self.workers[worker] + "/v1/cache/export", data=b"",
-                    headers=self.headers(), stream=True, timeout=(10, 120)) as r:
-                r.raise_for_status()
-                size = int(r.headers.get("Content-Length", "0"))
-                identity, digest = r.headers.get("X-Strata-KV-Model", ""), r.headers.get("X-Strata-KV-SHA256", "")
-                if not 0 < size <= min(MAX_SNAPSHOT, self.budget) or not identity or len(digest) != 64:
-                    raise ValueError("invalid snapshot response")
-                sha = hashlib.sha256()
-                total = 0
-                with tempfile.NamedTemporaryFile(dir=self.directory.name, delete=False) as f:
-                    path = f.name
-                    for block in r.iter_content(1024 * 1024):
-                        total += len(block)
-                        if total > size:
-                            raise ValueError("snapshot exceeds announced size")
-                        sha.update(block); f.write(block)
-                if total != size or not hmac.compare_digest(sha.hexdigest(), digest):
-                    raise ValueError("snapshot length or SHA256 mismatch")
-            with self.mutex:
-                previous = self.cache.pop(session, None)
-                if previous:
-                    os.unlink(previous["path"])
-                while self.cache and (len(self.cache) >= self.slots or
-                        sum(x["size"] for x in self.cache.values()) + size > self.budget):
-                    _, old = self.cache.popitem(last=False)
-                    os.unlink(old["path"])
-                self.cache[session] = {"path": path, "size": size, "identity": identity,
-                                       "sha": digest, "worker": worker}
-                path = None
-                self.stats["exports"] += 1; self.stats["export_bytes"] += size
-        except (OSError, ValueError, requests.RequestException):
-            with self.mutex:
-                self.stats["cache_errors"] += 1
-        finally:
-            if path:
-                os.unlink(path)
 
 def make_handler(pool):
     class Handler(BaseHTTPRequestHandler):
@@ -126,8 +61,9 @@ def make_handler(pool):
                 return
             if self.path in ("/health", "/v1/status"):
                 with pool.mutex:
-                    state = {**pool.stats, "sessions": len(pool.cache),
-                             "cache_bytes": sum(x["size"] for x in pool.cache.values()), "workers": pool.workers}
+                    state = {**pool.stats, "routing": "sticky", "kv_transfer": False,
+                             "workers": pool.workers,
+                             "requests_by_worker": dict(zip(pool.workers, pool.requests_by_worker))}
                 self.json(200, state)
             elif self.path == "/v1/models":
                 try:
@@ -144,7 +80,7 @@ def make_handler(pool):
                 self.json(404, {"error": {"message": "not found"}}); return
             if not pool.admission.acquire(blocking=False):
                 self.json(429, {"error": {"message": "pool queue is full"}}); return
-            worker = pool.choose()
+            worker = None
             acquired = False
             sent = False
             try:
@@ -175,10 +111,10 @@ def make_handler(pool):
                                                    "tools": req.get("tools")}, sort_keys=True,
                                                   ensure_ascii=False) if initial else ""
                 session = hashlib.sha256(session_material.encode()).hexdigest() if session_material else None
+                worker = pool.choose(session)
                 acquired = pool.locks[worker].acquire(timeout=120)
                 if not acquired:
                     self.json(503, {"error": {"message": "worker queue timeout"}}); return
-                imported = pool.import_session(session, worker)
                 with requests.post(pool.workers[worker] + self.path, data=body,
                         headers={**pool.headers(), "Content-Type": "application/json"},
                         stream=True, timeout=(10, 120)) as r:
@@ -186,7 +122,7 @@ def make_handler(pool):
                     self.send_header("Content-Type", r.headers.get("Content-Type", "application/json"))
                     self.send_header("Connection", "close")
                     self.send_header("X-Strata-Worker", pool.workers[worker])
-                    self.send_header("X-Strata-KV-Imported", str(imported).lower())
+                    self.send_header("X-Strata-Routing", "sticky")
                     self.end_headers(); sent = True
                     self.close_connection = True
                     if req.get("stream"):
@@ -196,9 +132,9 @@ def make_handler(pool):
                         for block in r.iter_content(65536):
                             if block:
                                 self.wfile.write(block); self.wfile.flush()
-                    if r.status_code == 200:
-                        pool.export_session(session, worker)
             except (ValueError, OSError, requests.RequestException) as e:
+                with pool.mutex:
+                    pool.stats["errors"] += 1
                 if not sent:
                     self.json(502, {"error": {"message": str(e)}})
                 self.close_connection = True
@@ -213,17 +149,14 @@ def main():
     ap.add_argument("--config", required=True)
     args = ap.parse_args()
     cfg = json.loads(Path(args.config).read_text())
-    pool = Pool(cfg["workers"], os.environ.get("STRATA_API_KEY", ""),
-                cfg.get("cache_mib", 4096) * 1024 * 1024, cfg.get("cache_slots", 16))
-    if pool.budget <= 0 or pool.slots <= 0:
-        raise ValueError("cache budget and slots must be positive")
+    pool = Pool(cfg["workers"], os.environ.get("STRATA_API_KEY", ""))
     httpd = ThreadingHTTPServer((cfg.get("host", "127.0.0.1"), cfg.get("port", 18081)), make_handler(pool))
     httpd.daemon_threads = True
-    print(f"KV pool ready on {httpd.server_address}", flush=True)
+    print(f"Sticky gateway ready on {httpd.server_address}", flush=True)
     try:
         httpd.serve_forever()
     finally:
-        httpd.server_close(); pool.directory.cleanup()
+        httpd.server_close()
 
 if __name__ == "__main__":
     main()
