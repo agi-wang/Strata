@@ -1,6 +1,7 @@
 """Binary endpoint admission and authentication without a GPU."""
 import hashlib
 import os
+import threading
 import unittest
 import urllib.error
 import urllib.request
@@ -39,13 +40,45 @@ class CacheTransfer(unittest.TestCase):
         with self.request("export") as r:
             data = r.read()
             sha, identity = r.headers["X-Strata-KV-SHA256"], r.headers["X-Strata-KV-Model"]
+            self.assertGreaterEqual(float(r.headers["X-Strata-KV-Engine-Ms"]), 0)
+            self.assertGreaterEqual(float(r.headers["X-Strata-KV-Hash-Ms"]), 0)
         self.assertEqual(sha, hashlib.sha256(data).hexdigest())
         with self.request("import", data, **{"X-Strata-KV-Model": identity, "X-Strata-KV-SHA256": sha}) as r:
             self.assertEqual(r.status, 200)
+            import json
+            timings = json.load(r)["timings"]
+            self.assertGreaterEqual(timings["receive_ms"], 0)
+            self.assertGreaterEqual(timings["engine_ms"], 0)
         self.assertEqual(self.engine.imported, data)
         with self.request("clear") as r:
             self.assertEqual(r.status, 200)
         self.assertTrue(self.engine.cleared)
+    def test_response_releases_engine_before_file_cleanup(self):
+        original_unlink = os.unlink
+        cleaning, allow_cleanup, finished = threading.Event(), threading.Event(), threading.Event()
+        def delayed_unlink(path, *args, **kwargs):
+            if Path(path).name.startswith("strata-kv-"):
+                cleaning.set()
+                allow_cleanup.wait(5)
+                try:
+                    return original_unlink(path, *args, **kwargs)
+                finally:
+                    finished.set()
+            return original_unlink(path, *args, **kwargs)
+        with patch("serve.server.os.unlink", side_effect=delayed_unlink):
+            try:
+                with self.request("export") as r:
+                    self.assertEqual(r.read(), self.engine.payload)
+                self.assertTrue(cleaning.wait(1))
+                # The previous handler is still cleaning its private file, but
+                # this subsequent engine command must already be admitted.
+                with self.request("clear") as r:
+                    self.assertEqual(r.status, 200)
+                self.assertTrue(self.engine.cleared)
+            finally:
+                allow_cleanup.set()
+                self.assertTrue(finished.wait(1))
+
     def test_rejects_bad_identity_and_hash(self):
         for identity, digest in [("model-B", hashlib.sha256(b"x").hexdigest()), ("model-A", "0" * 64)]:
             with self.assertRaises(urllib.error.HTTPError) as e:

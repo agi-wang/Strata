@@ -50,6 +50,13 @@ request writes GPU state. Failed GPU restores terminate the engine instead of
 continuing with partial state. A transfer timeout also ends the engine so a late
 control reply cannot corrupt its next token stream.
 
+The engine lock is released before sending a completed control response or
+streaming a detached export file. The export response reports
+`X-Strata-KV-Engine-Ms` (capture and serialization) and `X-Strata-KV-Hash-Ms`.
+Import JSON reports `timings.receive_ms` (upload, checksum and temporary-file
+write) and `timings.engine_ms` (CPU decoding, validation and cache admission).
+GPU restoration happens on the next matching generation, not during import.
+
 The wire format is versioned, little-endian and contains no pointers or GPU
 addresses. SHA-256 checks the HTTP payload; an internal checksum detects damaged
 files. File size is capped at 1 GiB, token vectors at 32K, checkpoints at 32 and
@@ -133,6 +140,26 @@ upload, checksum and CPU decoding. A three-turn conversation through the entranc
 rotated across all three machines and returned `749`, `700`, `708`. Turns two and
 three imported real state and reused 957 and 989 tokens; the entrance recorded two
 imports, three exports and zero cache errors.
+
+Phase measurements after adding endpoint telemetry, with approximately 369 MB
+snapshots and the same verifier placement:
+
+| Direction | Capture / serialize | Export SHA-256 | Download to verifier | Target receive / verify / write | CPU import | Export + import |
+|---|---:|---:|---:|---:|---:|---:|
+| Other 4090D → 5090 | 0.371 s | 0.146 s | 0.628 s | 0.180 s | 0.339 s | 1.667 s |
+| 5090 → 4090D with 32GB host RAM | 0.390 s | 0.146 s | 0.184 s | 3.137 s | 0.453 s | 4.313 s |
+| 4090D with 32GB host RAM → other 4090D | 0.710 s | 0.195 s | 3.157 s | 0.629 s | 0.375 s | 5.069 s |
+
+The first network download achieved 587.3 MB/s. The second download was local to
+the verifier; its network leg is target receive, about 117.6 MB/s including the
+receiver's checksum and file writes. These phases are application measurements,
+not isolated network latency. Target prefixes were cleared in both checks;
+generation reused 943/945 tokens and recomputed seven, returning `749` in
+0.081/0.092 s. Target cold generation took 0.598/0.816 s. Therefore the current
+snapshot path costs more than recomputation for this roughly 950-token prompt.
+The third direction crosses both network legs via the verifier: its slower leg
+downloaded at 116.8 MB/s; it also reused 943 tokens, recomputed seven and returned
+`749` in 0.075 s after import.
 
 These are short correctness checks, not quality or sustained-load benchmarks.
 The recurrent state makes even short snapshots hundreds of MB. Transfer is

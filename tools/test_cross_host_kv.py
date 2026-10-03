@@ -44,6 +44,10 @@ def main():
         with requests.post(args.source.rstrip('/') + '/v1/cache/export', data=b'', headers=headers,
                            stream=True, timeout=(10, 120)) as r:
             r.raise_for_status()
+            header_s = time.monotonic() - start
+            download_start = time.monotonic()
+            source_engine_ms = float(r.headers.get('X-Strata-KV-Engine-Ms', 0))
+            source_hash_ms = float(r.headers.get('X-Strata-KV-Hash-Ms', 0))
             sha = hashlib.sha256(); size = 0
             identity, digest = r.headers['X-Strata-KV-Model'], r.headers['X-Strata-KV-SHA256']
             for block in r.iter_content(1024 * 1024):
@@ -52,6 +56,7 @@ def main():
                     raise ValueError('snapshot exceeds 1 GiB')
                 sha.update(block); snapshot.write(block)
             assert sha.hexdigest() == digest
+            download_s = time.monotonic() - download_start
         export_s = time.monotonic() - start
         # Remove ALL target state, including parked prefixes from its cold run.
         # The imported snapshot must be the sole source of the subsequent cache hit.
@@ -64,10 +69,17 @@ def main():
                            headers={**headers, 'X-Strata-KV-Model': identity, 'X-Strata-KV-SHA256': digest},
                            timeout=(10, 120)) as r:
             r.raise_for_status()
+            target_timings = r.json().get('timings', {})
         import_s = time.monotonic() - start
     warm = generate(args.target)
     evidence = {'source': args.source, 'target': args.target, 'snapshot_bytes': size,
                 'model_identity': identity, 'export_s': round(export_s, 3), 'import_s': round(import_s, 3),
+                'transfer': {'export_engine_ms': source_engine_ms, 'export_hash_ms': source_hash_ms,
+                             'export_header_s': round(header_s, 3), 'download_s': round(download_s, 3),
+                             'download_MB_s': round(size / max(download_s, 1e-9) / 1e6, 1),
+                             'receive_ms': target_timings.get('receive_ms'),
+                             'import_engine_ms': target_timings.get('engine_ms'),
+                             'export_plus_import_s': round(export_s + import_s, 3)},
                 'cold': cold, 'source_result': source, 'warm': warm}
     assert cold['answer'].strip() == source['answer'].strip() == warm['answer'].strip() == '749', evidence
     assert warm['timings']['cache_n'] > 512 and warm['timings']['prompt_n'] < cold['timings']['prompt_n'], evidence

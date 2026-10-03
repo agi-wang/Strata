@@ -2248,10 +2248,12 @@ def make_handler(svc: Service):
             if not svc.fifo.acquire(blocking=False):
                 self._json(409, {"error": {"message": "engine is busy"}})
                 return
+            locked = True
             path = None
             original_timeout = self.connection.gettimeout()
             try:
                 self.connection.settimeout(120)
+                receive_start = time.monotonic()
                 with tempfile.NamedTemporaryFile(prefix="strata-kv-", delete=False) as f:
                     path = f.name
                     if importing:
@@ -2272,10 +2274,20 @@ def make_handler(svc: Service):
                             remaining -= len(block)
                         if not hmac.compare_digest(sha.hexdigest(), digest):
                             raise ValueError("snapshot SHA256 mismatch")
+                receive_ms = (time.monotonic() - receive_start) * 1000 if importing else 0.0
+                engine_start = time.monotonic()
                 svc.engine.transfer_cache(operation, path)
+                engine_ms = (time.monotonic() - engine_start) * 1000
+                # The snapshot is detached from GPU state now. Release before
+                # sending any response, including slow binary downloads.
+                svc.fifo.release()
+                locked = False
                 if operation != "EXPORT":
-                    self._json(200, {"status": "imported" if importing else "cleared", "model_identity": identity})
+                    self._json(200, {"status": "imported" if importing else "cleared", "model_identity": identity,
+                                     "timings": {"receive_ms": round(receive_ms, 3),
+                                                 "engine_ms": round(engine_ms, 3)}})
                 else:
+                    hash_start = time.monotonic()
                     sha = hashlib.sha256()
                     with open(path, "rb") as f:
                         while block := f.read(1024 * 1024):
@@ -2286,10 +2298,15 @@ def make_handler(svc: Service):
                         self.send_header("Content-Length", str(os.path.getsize(path)))
                         self.send_header("X-Strata-KV-Model", identity)
                         self.send_header("X-Strata-KV-SHA256", sha.hexdigest())
+                        self.send_header("X-Strata-KV-Engine-Ms", f"{engine_ms:.3f}")
+                        self.send_header("X-Strata-KV-Hash-Ms", f"{(time.monotonic() - hash_start) * 1000:.3f}")
                         self.end_headers()
                         while block := f.read(1024 * 1024):
                             self.wfile.write(block)
             except (ValueError, OSError) as e:
+                if locked:
+                    svc.fifo.release()
+                    locked = False
                 self.close_connection = True
                 self._json(400, {"error": {"message": str(e)}})
             finally:
@@ -2299,7 +2316,8 @@ def make_handler(svc: Service):
                     except FileNotFoundError:
                         pass
                 self.connection.settimeout(original_timeout)
-                svc.fifo.release()
+                if locked:
+                    svc.fifo.release()
 
         def do_POST(self):
             if not self._authorized():
