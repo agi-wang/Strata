@@ -17,6 +17,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/conversation_wire.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
@@ -5050,6 +5051,58 @@ int main(int argc, char** argv) {
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
             if (line == "QUIT") break;
+            if (line.rfind("KV_CLEAR ", 0) == 0) {
+                conversations = strata::core::ConversationCache(
+                    o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
+                    (size_t) o.conversation_cache_slots);
+                live_ok = false;
+                live.clear(); live_imgs.clear(); checks.clear();
+                std::printf("KV_OK cleared\n"); std::fflush(stdout);
+                continue;
+            }
+            if (line.rfind("KV_EXPORT ", 0) == 0 || line.rfind("KV_IMPORT ", 0) == 0) {
+                const bool importing = line.rfind("KV_IMPORT ", 0) == 0;
+                const std::string path = line.substr(10);
+                const char* identity = std::getenv("STRATA_KV_MODEL_ID");
+                const size_t limit = 1024ull * 1024 * 1024;
+                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                std::string failure;
+                strata::core::SavedConversation image;
+                bool ok = false;
+                try {
+                    if (!identity || !*identity || !conversations.enabled() || n_stages != 1)
+                        failure = "transfer requires model identity and single-GPU conversation cache";
+                    else if (importing) {
+                        // Admit the maximum file allocation before parsing untrusted lengths.
+                        if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
+                                limit * 2, floor)) failure = "insufficient free RAM for import";
+                        else if (strata::core::conversation_wire_file(path, image, identity, true, limit, failure) &&
+                                 strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), failure)) {
+                            if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
+                                    0, floor)) failure = "RAM floor after import";
+                            else if (!(ok = conversations.put(std::move(image)))) failure = "cache budget exceeded";
+                        }
+                    } else if (!live_ok || live.empty()) failure = "no live conversation";
+                    else {
+                        const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
+                        size_t estimate = 0;
+                        if (strata::core::conversation_snapshot_bytes(view, ss, g, mtp.kv_state(), estimate, failure)) {
+                            if (estimate > limit || !strata::core::conversation_memory_admit(
+                                    strata::core::conversation_available_memory(), estimate, floor))
+                                failure = "snapshot exceeds transfer or RAM limit";
+                            else {
+                                if (cudaDeviceSynchronize() != cudaSuccess) return 1;
+                                if (strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(), failure))
+                                    ok = strata::core::conversation_wire_file(path, image, identity, false, limit, failure);
+                            }
+                        }
+                    }
+                } catch (const std::exception& e) { failure = e.what(); }
+                std::printf("%s %s\n", ok ? "KV_OK" : "KV_ERR", ok ? (importing ? "imported" : "exported") : failure.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
                 BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
