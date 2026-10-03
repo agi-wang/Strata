@@ -444,6 +444,27 @@ class StrataEngine:
         if len(f) >= 15:                                  # #471 (engine 0.1.36+): the prompt tokens actually read
             self.last.update(prompt_read=int(f[14]))
 
+    def transfer_cache(self, operation: str, path: str) -> None:
+        """Caller holds Service.fifo; control messages never enter the token stream."""
+        if operation not in ("EXPORT", "IMPORT", "CLEAR") or any(c.isspace() for c in path):
+            raise ValueError("invalid cache command")
+        if not self.alive():
+            raise ValueError("engine is not loaded")
+        self.proc.stdin.write(f"KV_{operation} {path}\n")
+        self.proc.stdin.flush()
+        try:
+            line = self.lines.get(timeout=120)
+        except queue.Empty:
+            self.proc.kill()  # A late reply would corrupt the next GEN protocol.
+            raise ValueError("cache command timed out; engine stopped")
+        if line is None:
+            raise ValueError("engine exited during cache transfer")
+        if line.startswith("KV_ERR "):
+            raise ValueError(line[7:].strip())
+        if not line.startswith("KV_OK "):
+            self.proc.kill()
+            raise ValueError("unexpected cache response; engine stopped")
+
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
@@ -2217,11 +2238,77 @@ def make_handler(svc: Service):
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
+        def _cache_transfer(self, operation):
+            importing = operation == "IMPORT"
+            # Opt-in and authenticated. The client never supplies a filesystem path.
+            identity = os.environ.get("STRATA_KV_MODEL_ID", "")
+            if not svc.api_key or not identity or not hasattr(svc.engine, "transfer_cache"):
+                self._json(404, {"error": {"message": "cache transfer is disabled"}})
+                return
+            if not svc.fifo.acquire(blocking=False):
+                self._json(409, {"error": {"message": "engine is busy"}})
+                return
+            path = None
+            original_timeout = self.connection.gettimeout()
+            try:
+                self.connection.settimeout(120)
+                with tempfile.NamedTemporaryFile(prefix="strata-kv-", delete=False) as f:
+                    path = f.name
+                    if importing:
+                        size = int(self.headers.get("Content-Length", "0"))
+                        digest = self.headers.get("X-Strata-KV-SHA256", "")
+                        if self.headers.get("X-Strata-KV-Model") != identity:
+                            raise ValueError("snapshot model identity mismatch")
+                        if not 0 < size <= 1024 * 1024 * 1024 or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                            raise ValueError("invalid snapshot length or SHA256")
+                        sha = hashlib.sha256()
+                        remaining = size
+                        while remaining:
+                            block = self.rfile.read(min(1024 * 1024, remaining))
+                            if not block:
+                                raise ValueError("truncated snapshot upload")
+                            sha.update(block)
+                            f.write(block)
+                            remaining -= len(block)
+                        if not hmac.compare_digest(sha.hexdigest(), digest):
+                            raise ValueError("snapshot SHA256 mismatch")
+                svc.engine.transfer_cache(operation, path)
+                if operation != "EXPORT":
+                    self._json(200, {"status": "imported" if importing else "cleared", "model_identity": identity})
+                else:
+                    sha = hashlib.sha256()
+                    with open(path, "rb") as f:
+                        while block := f.read(1024 * 1024):
+                            sha.update(block)
+                        f.seek(0)
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/octet-stream")
+                        self.send_header("Content-Length", str(os.path.getsize(path)))
+                        self.send_header("X-Strata-KV-Model", identity)
+                        self.send_header("X-Strata-KV-SHA256", sha.hexdigest())
+                        self.end_headers()
+                        while block := f.read(1024 * 1024):
+                            self.wfile.write(block)
+            except (ValueError, OSError) as e:
+                self.close_connection = True
+                self._json(400, {"error": {"message": str(e)}})
+            finally:
+                if path:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+                self.connection.settimeout(original_timeout)
+                svc.fifo.release()
+
         def do_POST(self):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
+                return
+            if path in ("/v1/cache/export", "/v1/cache/import", "/v1/cache/clear"):
+                self._cache_transfer(path.rsplit("/", 1)[-1].upper())
                 return
             if path == "/settings":
                 self._settings()
