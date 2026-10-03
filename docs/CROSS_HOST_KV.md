@@ -3,8 +3,10 @@
 This fork adds real snapshot transfer between independent single-GPU Strata workers.
 A receiving worker restores the donor's KV pages, recurrent/GDN and PLE state,
 indexer tails, checkpoints and draft KV. It then skips the matching prompt prefix.
-The gateway rotates requests between workers; reuse does not depend on routing a
-conversation back to its original machine.
+The worker endpoints allow explicit snapshot migration. The production entrance
+now uses [sticky forwarding](STICKY_GATEWAY.md), with KV kept local on each worker;
+it does not invoke these transfer endpoints. The measurements below describe the
+earlier migration experiment, not current gateway behavior.
 
 Use the same fork revision, exact GGUF quantization, tokenizer, packed dense and
 MTP weights on every worker. IQ2_XS and IQ3_XXS cannot exchange snapshots. Runtime
@@ -63,43 +65,12 @@ files. File size is capped at 1 GiB, token vectors at 32K, checkpoints at 32 and
 layer records at 256. Imports and captures also obey the worker's RAM floor and
 cache budget. Temporary files are private and removed after the operation.
 
-## Run the shared entrance
+## Production entrance
 
-Create a private gateway config:
-
-```json
-{
-  "host": "127.0.0.1",
-  "port": 18090,
-  "workers": ["http://worker-a:18080", "http://worker-b:18080", "http://worker-c:18080"],
-  "cache_mib": 4096,
-  "cache_slots": 16
-}
-```
-
-Run with the same `STRATA_API_KEY`:
-
-```bash
-python -m serve.kv_gateway --config kv-pool.json
-```
-
-Clients use the gateway's `/v1` base URL and the existing model name and key.
-Ordinary OpenAI chat requests automatically identify their cache branch from the
-initial messages and tools. A stable `X-Strata-Session` header can explicitly
-identify a conversation. Exact token, image and steering matches in the engine
-remain the authority; a mistaken session label never authorizes incompatible KV.
-
-The gateway imports a saved snapshot before a turn moves to another worker and
-exports its completed state afterwards. The response reports `X-Strata-Worker`
-and `X-Strata-KV-Imported`; **actual reuse** is `timings.cache_n` in the model
-response. Imported state without a matching prefix is a cache miss.
-
-Storage is bounded by both bytes and slots, with LRU eviction. The gateway admits
-at most 64 requests and serializes each worker's transactions. Snapshots are
-private ephemeral files, removed on eviction or normal shutdown. `/v1/status`
-reports import/export counts, transferred bytes, cache errors and retained size.
-The entrance currently implements OpenAI chat completions, models and status;
-use worker URLs directly for the other Strata APIs.
+Use [sticky forwarding](STICKY_GATEWAY.md). The earlier round-robin snapshot gateway
+was replaced: its import/export calls and shared snapshot files were removed.
+Binary worker endpoints and the bounded migration verifier remain available for
+explicit diagnostics; no cross-host snapshot is required for production routing.
 
 ## Validation
 
@@ -113,7 +84,7 @@ c++ -std=c++20 -O2 -DNDEBUG -Iinclude src/core/conversation_wire_test.cpp -o wir
 
 The C++ test also participates in CMake's conversation tests. The HTTP tests cover
 authentication, model/checksum rejection, busy handling, actual binary transport,
-round-robin migration, SSE, automatic conversation identification and eviction.
+sticky forwarding, SSE and automatic conversation identification.
 
 Run a bounded real-GPU check against idle workers:
 
@@ -164,10 +135,9 @@ downloaded at 116.8 MB/s; it also reused 943 tokens, recomputed seven and return
 These are short correctness checks, not quality or sustained-load benchmarks.
 The recurrent state makes even short snapshots hundreds of MB. Transfer is
 currently synchronous and uncompressed: short chats can be faster to recompute.
-Snapshots beyond the cap, missing prefixes, busy peers and transfer errors safely
-fall back to prefill at the entrance. Worker inference errors still return errors.
-Restarting the entrance discards its caches. Direct calls to workers bypass the
-entrance's migration transactions and may reduce cache hit rate. There is no
+Explicit transfers reject snapshots beyond the cap and incompatible prefixes.
+The current sticky entrance forwards inference errors and keeps no snapshots.
+Direct calls to workers can change their local cache contents and reduce hits. There is no
 per-token synchronization or shared GPU address space across machines.
 
 Network measurement in the same deployment: the 5090 negotiated 10Gbps; the
